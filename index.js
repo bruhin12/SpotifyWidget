@@ -67,9 +67,42 @@ async function ensureAccessToken() {
 
 // ----- ROUTES -----
 
-// Prosty root – przekierowanie na widget
+// Root – prosty ekran pomocniczy z linkami
 app.get('/', (req, res) => {
-  res.redirect('/widget');
+  res.send(`
+    <html>
+      <head>
+        <meta charset="UTF-8" />
+        <title>Spotify Widget</title>
+        <style>
+          body {
+            background:#111;
+            color:#fff;
+            font-family: Arial, sans-serif;
+            padding: 24px;
+          }
+          a {
+            color:#1ed760;
+            text-decoration:none;
+            font-size:18px;
+            display:inline-block;
+            margin:8px 0;
+          }
+          a:hover { text-decoration:underline; }
+        </style>
+      </head>
+      <body>
+        <h2>Spotify Widget – panel serwera</h2>
+        <p>
+          1. <a href="/login">Zaloguj się do Spotify</a><br/>
+          2. Potem otwórz <a href="/widget" target="_blank">/widget</a> (tego używasz w OBS).<br/>
+        </p>
+        <p style="margin-top:20px;opacity:0.7;font-size:13px;">
+          Primary URL: ${redirectUri.replace('/callback', '')}
+        </p>
+      </body>
+    </html>
+  `);
 });
 
 // Logowanie do Spotify
@@ -128,7 +161,7 @@ app.get('/callback', async (req, res) => {
     res.send(
       '<html><body style="background:#111;color:#fff;font-family:Arial;padding:20px;">' +
         '<h2>Zalogowano do Spotify ✅</h2>' +
-        '<p>Możesz zamknąć to okno i włączyć streama.</p>' +
+        '<p>Możesz zamknąć to okno i wejść na <a href="/widget" style="color:#1ed760;">/widget</a>, a w OBS użyć tego samego adresu.</p>' +
         '</body></html>'
     );
   } catch (err) {
@@ -151,7 +184,6 @@ app.get('/current-track', async (req, res) => {
   }
 
   try {
-    // /me/player zwraca też dane, gdy jest pauza
     const playerRes = await fetch('https://api.spotify.com/v1/me/player', {
       headers: {
         Authorization: 'Bearer ' + accessToken,
@@ -193,7 +225,7 @@ app.get('/current-track', async (req, res) => {
   }
 });
 
-// Widget – kompaktowa karta
+// Widget – kompaktowa karta (już nigdy nie jest kompletnie pusto)
 app.get('/widget', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -228,17 +260,10 @@ app.get('/widget', (req, res) => {
           background: #40373c;
           border: 1px solid rgba(0,0,0,0.9);
           box-shadow: 0 10px 24px rgba(0,0,0,0.8), 0 0 10px rgba(0,0,0,0.6);
-          opacity: 0;
-          transform: translateY(5px);
-          transition: opacity 0.2s ease, transform 0.2s ease;
-          pointer-events: none;
-          width: auto;
-        }
-
-        .card.visible {
           opacity: 1;
           transform: translateY(0);
           pointer-events: auto;
+          width: auto;
         }
 
         .card::before {
@@ -257,13 +282,23 @@ app.get('/widget', (req, res) => {
           overflow: hidden;
           flex-shrink: 0;
           box-shadow: 0 8px 18px rgba(0,0,0,0.8), 0 0 8px rgba(0,0,0,0.7);
+          background: #222;
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          font-size:11px;
+          color:#aaa;
         }
 
         .cover img {
           width: 100%;
           height: 100%;
           object-fit: cover;
-          display: block;
+          display: none;
+        }
+
+        .cover.has-image img {
+          display:block;
         }
 
         .info {
@@ -278,6 +313,12 @@ app.get('/widget', (req, res) => {
           opacity: 0.8;
           margin-bottom: 2px;
           text-align: left;
+        }
+
+        .status-label {
+          font-size: 10px;
+          opacity: 0.8;
+          margin-bottom: 2px;
         }
 
         .info-inner {
@@ -345,16 +386,18 @@ app.get('/widget', (req, res) => {
     </head>
     <body>
       <div class="card" id="root">
-        <div class="cover">
+        <div class="cover" id="cover-box">
           <img id="cover-img" src="" alt="">
+          <span id="cover-placeholder">Brak</span>
         </div>
 
         <div class="info">
           <div class="top-label">Spotify</div>
 
           <div class="info-inner">
-            <div class="title" id="title"></div>
-            <div class="artist" id="artist"></div>
+            <div class="status-label" id="status-label">Offline / nie zalogowano</div>
+            <div class="title" id="title">Nic nie gra</div>
+            <div class="artist" id="artist">Zaloguj się przez /login</div>
 
             <div class="progress-wrap">
               <div class="progress-bar">
@@ -371,9 +414,12 @@ app.get('/widget', (req, res) => {
 
       <script>
         const rootEl = document.getElementById('root');
-        const coverEl = document.getElementById('cover-img');
+        const coverBoxEl = document.getElementById('cover-box');
+        const coverImgEl = document.getElementById('cover-img');
+        const coverPlaceholderEl = document.getElementById('cover-placeholder');
         const titleEl = document.getElementById('title');
         const artistEl = document.getElementById('artist');
+        const statusLabelEl = document.getElementById('status-label');
         const progressFillEl = document.getElementById('progress-fill');
         const currentTimeEl = document.getElementById('current-time');
         const totalTimeEl = document.getElementById('total-time');
@@ -388,30 +434,40 @@ app.get('/widget', (req, res) => {
 
         async function fetchTrack() {
           try {
-            // WAŻNE: ścieżka względna, żeby działało na Renderze
             const res = await fetch('/current-track');
             const data = await res.json();
 
             if (!data.active) {
-              rootEl.classList.remove('visible');
-              titleEl.textContent = "";
-              artistEl.textContent = "";
-              coverEl.src = "";
-              progressFillEl.style.width = "0%";
-              currentTimeEl.textContent = "0:00";
-              totalTimeEl.textContent = "0:00";
+              // STAN OFFLINE / BRAK DANYCH
+              statusLabelEl.textContent = 'Offline / brak odtwarzania';
+              titleEl.textContent = 'Nic nie gra';
+              artistEl.textContent = 'Zaloguj się przez /login i włącz muzykę';
+              coverImgEl.src = '';
+              coverBoxEl.classList.remove('has-image');
+              coverPlaceholderEl.style.display = 'block';
+              progressFillEl.style.width = '0%';
+              currentTimeEl.textContent = '0:00';
+              totalTimeEl.textContent = '0:00';
               return;
             }
 
-            rootEl.classList.add('visible');
+            // STAN ON – coś gra lub jest zapauzowane
+            statusLabelEl.textContent = data.playing ? 'Playing' : 'Paused';
+            titleEl.textContent = data.title || '';
+            artistEl.textContent = data.artist || '';
 
-            titleEl.textContent = data.title || "";
-            artistEl.textContent = data.artist || "";
-            coverEl.src = data.cover || "";
+            if (data.cover) {
+              coverImgEl.src = data.cover;
+              coverBoxEl.classList.add('has-image');
+              coverPlaceholderEl.style.display = 'none';
+            } else {
+              coverImgEl.src = '';
+              coverBoxEl.classList.remove('has-image');
+              coverPlaceholderEl.style.display = 'block';
+            }
 
             const duration = data.duration_ms || 0;
             const progress = data.progress_ms || 0;
-
             totalTimeEl.textContent = formatTime(duration);
             currentTimeEl.textContent = formatTime(progress);
 
