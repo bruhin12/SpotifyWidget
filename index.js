@@ -99,8 +99,7 @@ app.get('/callback', async (req, res) => {
     return res.status(400).send('Brak kodu autoryzacji z Spotify');
   }
 
-  try:
-  {
+  try {
     const body = new URLSearchParams();
     body.append('grant_type', 'authorization_code');
     body.append('code', code);
@@ -175,9 +174,7 @@ app.get('/current-track', async (req, res) => {
 
     const item = data.item;
     const title = item.name;
-    const artist = (item.artists || [])
-      .map((a) => a.name)
-      .join(', ');
+    const artist = (item.artists || []).map((a) => a.name).join(', ');
     const images = item.album && item.album.images ? item.album.images : [];
     const cover = images.length ? images[0].url : '';
 
