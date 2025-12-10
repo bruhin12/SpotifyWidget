@@ -1,85 +1,202 @@
+require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const SpotifyWebApi = require('spotify-web-api-node');
-const path = require('path');
-
-console.log('Plik index.js się uruchomił');
 
 const app = express();
-app.use(cors());
 
-const port = 8888;
+// ----- KONFIGURACJA SPOTIFY -----
+const clientId = process.env.SPOTIFY_CLIENT_ID;
+const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+const redirectUri =
+  process.env.SPOTIFY_REDIRECT_URI || 'http://127.0.0.1:8888/callback';
 
-// WKLEJ SWOJE DANE Z DASHBOARDU SPOTIFY:
-const spotifyApi = new SpotifyWebApi({
-  clientId: '6c2384e5a0a94eab9e9f85d60a58ea1a',
-  clientSecret: '84af2d7c281a40df8ce83e59f1d9ee0b',
-  redirectUri: 'http://127.0.0.1:8888/callback'
-});
+if (!clientId || !clientSecret || !redirectUri) {
+  console.warn(
+    'Brakuje SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET / SPOTIFY_REDIRECT_URI w zmiennych środowiskowych.'
+  );
+}
 
-// 1. Logowanie do Spotify
-app.get('/login', (req, res) => {
-  const scopes = ['user-read-currently-playing', 'user-read-playback-state'];
-  const authorizeURL = spotifyApi.createAuthorizeURL(scopes, 'some-state');
-  res.redirect(authorizeURL);
-});
+const SCOPES = [
+  'user-read-currently-playing',
+  'user-read-playback-state',
+].join(' ');
 
-// 2. Callback po logowaniu
-app.get('/callback', async (req, res) => {
-  const code = req.query.code || null;
-  try {
-    const data = await spotifyApi.authorizationCodeGrant(code);
-    spotifyApi.setAccessToken(data.body['access_token']);
-    spotifyApi.setRefreshToken(data.body['refresh_token']);
-    res.send('Zalogowano do Spotify. Możesz zamknąć to okno i odpalić stream.');
-  } catch (err) {
-    console.error('Błąd w /callback:', err);
-    res.status(500).send('Błąd logowania.');
+// ----- PROSTE PRZECHOWYWANIE TOKENÓW W PAMIĘCI -----
+let accessToken = null;
+let refreshToken = null;
+let tokenExpiresAt = 0;
+
+// ----- POMOCNICZE -----
+function toBase64(str) {
+  return Buffer.from(str).toString('base64');
+}
+
+async function refreshAccessToken() {
+  if (!refreshToken) {
+    throw new Error('Brak refresh tokena');
   }
-});
 
-// 3. Odświeżanie tokena
+  const body = new URLSearchParams();
+  body.append('grant_type', 'refresh_token');
+  body.append('refresh_token', refreshToken);
+
+  const res = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + toBase64(`${clientId}:${clientSecret}`),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error('Błąd odświeżania tokena: ' + text);
+  }
+
+  const data = await res.json();
+  accessToken = data.access_token;
+  const expiresInSec = data.expires_in || 3600;
+  tokenExpiresAt = Date.now() + (expiresInSec - 60) * 1000; // mały zapas
+}
+
 async function ensureAccessToken() {
-  try {
-    const data = await spotifyApi.refreshAccessToken();
-    spotifyApi.setAccessToken(data.body['access_token']);
-  } catch (err) {
-    console.error('Błąd odświeżania tokena', err);
+  if (!accessToken || Date.now() > tokenExpiresAt) {
+    await refreshAccessToken();
   }
 }
 
-// 4. Endpoint z aktualnie graną piosenką
-app.get('/current-track', async (req, res) => {
-  try {
-    const playback = await spotifyApi.getMyCurrentPlaybackState();
+// ----- ROUTES -----
 
-    // brak playbacku / brak utworu -> nic nie pokazujemy
-    if (!playback.body || !playback.body.item) {
-      return res.json({ active: false });
-    }
+// Prosty root – przekierowanie na widget
+app.get('/', (req, res) => {
+  res.redirect('/widget');
+});
 
-    const item = playback.body.item;
+// Logowanie do Spotify
+app.get('/login', (req, res) => {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    scope: SCOPES,
+    redirect_uri: redirectUri,
+  });
 
-    res.json({
-      active: true,                              // jest jakiś utwór
-      playing: playback.body.is_playing,         // true = gra, false = pauza
-      title: item.name,
-      artist: item.artists.map(a => a.name).join(', '),
-      album: item.album.name,
-      cover: item.album.images?.[0]?.url || null,
-      progress_ms: playback.body.progress_ms ?? 0,
-      duration_ms: item.duration_ms ?? 0
+  const url = `https://accounts.spotify.com/authorize?${params.toString()}`;
+  res.redirect(url);
+});
+
+// Callback po logowaniu
+app.get('/callback', async (req, res) => {
+  const code = req.query.code;
+  const error = req.query.error;
+
+  if (error) {
+    return res
+      .status(400)
+      .send('Błąd logowania do Spotify: ' + String(error));
+  }
+  if (!code) {
+    return res.status(400).send('Brak kodu autoryzacji z Spotify');
+  }
+
+  try:
+  {
+    const body = new URLSearchParams();
+    body.append('grant_type', 'authorization_code');
+    body.append('code', code);
+    body.append('redirect_uri', redirectUri);
+
+    const tokenRes = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + toBase64(`${clientId}:${clientSecret}`),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body,
     });
 
+    if (!tokenRes.ok) {
+      const text = await tokenRes.text();
+      throw new Error('Błąd pobierania tokena: ' + text);
+    }
+
+    const data = await tokenRes.json();
+    accessToken = data.access_token;
+    refreshToken = data.refresh_token || refreshToken;
+    const expiresInSec = data.expires_in || 3600;
+    tokenExpiresAt = Date.now() + (expiresInSec - 60) * 1000;
+
+    res.send(
+      '<html><body style="background:#111;color:#fff;font-family:Arial;padding:20px;">' +
+        '<h2>Zalogowano do Spotify ✅</h2>' +
+        '<p>Możesz zamknąć to okno i włączyć streama.</p>' +
+        '</body></html>'
+    );
   } catch (err) {
-    console.error('Błąd w /current-track:', err);
-    await ensureAccessToken();
-    res.status(500).json({ error: 'Error fetching track' });
+    console.error(err);
+    res.status(500).send('Błąd podczas logowania do Spotify.');
   }
 });
 
+// API: aktualny utwór / ostatnio odtwarzany (w tym pauza)
+app.get('/current-track', async (req, res) => {
+  if (!accessToken && !refreshToken) {
+    return res.json({ active: false });
+  }
 
-// 5. Widget: kompaktowa karta, tytuł/wykonawca wyśrodkowane nad paskiem
+  try {
+    await ensureAccessToken();
+  } catch (err) {
+    console.error('Błąd ensureAccessToken:', err);
+    return res.json({ active: false });
+  }
+
+  try {
+    // /me/player zwraca też dane, gdy jest pauza
+    const playerRes = await fetch('https://api.spotify.com/v1/me/player', {
+      headers: {
+        Authorization: 'Bearer ' + accessToken,
+      },
+    });
+
+    if (playerRes.status === 204) {
+      return res.json({ active: false });
+    }
+    if (!playerRes.ok) {
+      const text = await playerRes.text();
+      console.error('Błąd me/player:', text);
+      return res.json({ active: false });
+    }
+
+    const data = await playerRes.json();
+    if (!data || !data.item) {
+      return res.json({ active: false });
+    }
+
+    const item = data.item;
+    const title = item.name;
+    const artist = (item.artists || [])
+      .map((a) => a.name)
+      .join(', ');
+    const images = item.album && item.album.images ? item.album.images : [];
+    const cover = images.length ? images[0].url : '';
+
+    res.json({
+      active: true,
+      playing: Boolean(data.is_playing),
+      title,
+      artist,
+      cover,
+      progress_ms: data.progress_ms || 0,
+      duration_ms: item.duration_ms || 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.json({ active: false });
+  }
+});
+
+// Widget – kompaktowa karta
 app.get('/widget', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -93,9 +210,7 @@ app.get('/widget', (req, res) => {
       <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
 
       <style>
-        * {
-          box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
 
         body {
           margin: 0;
@@ -105,23 +220,17 @@ app.get('/widget', (req, res) => {
           color: #ffffff;
         }
 
-        /* Mała, zbita karta, szerokość = treść */
         .card {
           position: relative;
           display: inline-flex;
           align-items: center;
           gap: 10px;
           padding: 8px 10px;
-
           border-radius: 22px;
           overflow: hidden;
-
           background: #40373c;
           border: 1px solid rgba(0,0,0,0.9);
-          box-shadow:
-            0 10px 24px rgba(0,0,0,0.8),
-            0 0 10px rgba(0,0,0,0.6);
-
+          box-shadow: 0 10px 24px rgba(0,0,0,0.8), 0 0 10px rgba(0,0,0,0.6);
           opacity: 0;
           transform: translateY(5px);
           transition: opacity 0.2s ease, transform 0.2s ease;
@@ -144,16 +253,13 @@ app.get('/widget', (req, res) => {
           pointer-events: none;
         }
 
-        /* Okładka */
         .cover {
           width: 70px;
           height: 70px;
           border-radius: 18px;
           overflow: hidden;
           flex-shrink: 0;
-          box-shadow:
-            0 8px 18px rgba(0,0,0,0.8),
-            0 0 8px rgba(0,0,0,0.7);
+          box-shadow: 0 8px 18px rgba(0,0,0,0.8), 0 0 8px rgba(0,0,0,0.7);
         }
 
         .cover img {
@@ -163,7 +269,6 @@ app.get('/widget', (req, res) => {
           display: block;
         }
 
-        /* Prawa strona – blok wyśrodkowany */
         .info {
           display: flex;
           flex-direction: column;
@@ -178,7 +283,6 @@ app.get('/widget', (req, res) => {
           text-align: left;
         }
 
-        /* Szerokość wspólna dla tytułu, artysty i paska */
         .info-inner {
           width: 180px;
           display: flex;
@@ -187,30 +291,26 @@ app.get('/widget', (req, res) => {
         }
 
         .title {
-          font-size: 18px;              /* trochę większy */
+          font-size: 18px;
           font-weight: 700;
           letter-spacing: 0.01em;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
-          text-align: center;           /* wyśrodkowany nad paskiem */
-          text-shadow:
-            0 1px 3px rgba(0,0,0,0.9),
-            0 0 6px rgba(0,0,0,0.7);
+          text-align: center;
+          text-shadow: 0 1px 3px rgba(0,0,0,0.9), 0 0 6px rgba(0,0,0,0.7);
         }
 
         .artist {
-          font-size: 13px;              /* trochę większy */
+          font-size: 13px;
           font-weight: 500;
           opacity: 0.9;
           margin-top: 1px;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
-          text-align: center;           /* wyśrodkowany nad paskiem */
-          text-shadow:
-            0 1px 3px rgba(0,0,0,0.9),
-            0 0 6px rgba(0,0,0,0.7);
+          text-align: center;
+          text-shadow: 0 1px 3px rgba(0,0,0,0.9), 0 0 6px rgba(0,0,0,0.7);
         }
 
         .progress-wrap {
@@ -291,7 +391,8 @@ app.get('/widget', (req, res) => {
 
         async function fetchTrack() {
           try {
-            const res = await fetch('http://127.0.0.1:8888/current-track');
+            // WAŻNE: ścieżka względna, żeby działało na Renderze
+            const res = await fetch('/current-track');
             const data = await res.json();
 
             if (!data.active) {
@@ -337,9 +438,8 @@ app.get('/widget', (req, res) => {
   `);
 });
 
-
-
-app.listen(port, () => {
-  console.log(`Server działa na: http://127.0.0.1:${port}`);
-  console.log(`Wejdź w przeglądarce na: http://127.0.0.1:${port}/login`);
+// ----- START SERWERA -----
+const PORT = process.env.PORT || 8888;
+app.listen(PORT, () => {
+  console.log('Server działa na porcie: ' + PORT);
 });
